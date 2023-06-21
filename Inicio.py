@@ -1,7 +1,9 @@
 import math
 from PIL import Image
 import numpy as np
-import os
+import time
+import multiprocessing as mp
+
 def normalize(vector):
     return vector / np.linalg.norm(vector)
 
@@ -28,12 +30,23 @@ def ray_sphere_intersection(ray_origin, ray_direction, sphere_center, sphere_rad
         else:
             return None
 def random_hemisphere_direction(normal):
-    while True:
-        random_direction = np.random.uniform(-1, 1, 3)
-        if np.linalg.norm(random_direction) > 0:
-            random_direction = random_direction / np.linalg.norm(random_direction)
-            if np.dot(random_direction, normal) > 0:
-                return random_direction
+    u = np.random.rand()
+    v = np.random.rand()
+    
+    theta = 2.0 * np.pi * u
+    phi = np.arccos(2.0 * v - 1.0)
+    
+    x = np.cos(theta) * np.sin(phi)
+    y = np.sin(theta) * np.sin(phi)
+    z = np.cos(phi)
+    
+    random_direction = np.array([x, y, z])
+    
+    # Transform the direction from the hemisphere coordinate system to the world coordinate system
+    if random_direction.dot(normal) < 0:
+        random_direction = -random_direction
+    
+    return random_direction
 class Sphere:
     def __init__(self, center, radius, color, luminous=False):
         self.center = np.array(center)
@@ -49,7 +62,7 @@ class Ray:
         self.pos = []
         self.sphereHit = None
         self.bounces = 0
-    def trace(self, spheres, max_bounces, reflectedRays = 2):
+    def trace(self, spheres, max_bounces, reflectedRays):
         first_hit = None
         global tempoForSpheres
         global tempoForRays
@@ -72,9 +85,9 @@ class Ray:
                 self.bounces += 1
                 colors = np.zeros((reflectedRays, 3))
                 for i in range(reflectedRays):
-                    new_ray = Ray(self.origin, random_hemisphere_direction(normalize(self.origin - self.sphereHit.center)))
+                    new_ray = Ray(self.origin, self.direction)
                     new_ray.color, new_ray.lit, new_ray.bounces = self.color, self.lit, self.bounces
-                    color2 = new_ray.trace(spheres, max_bounces - 1)
+                    color2 = new_ray.trace(spheres, max_bounces - 1, reflectedRays)
                     self.lit = new_ray.lit
                     colors[i] = color2 if new_ray.lit else np.array([0,0,0])
                 self.color = colors.mean(axis=0)
@@ -82,7 +95,7 @@ class Ray:
             return self.color
         return np.array([0,0,0])
 
-    def reflect_ray(self, sphere):
+    def reflect_ray(self, sphere,):
         global tempoReflect
         t = ray_sphere_intersection(self.origin, self.direction, sphere.center, sphere.radius)
         if t is None:
@@ -91,6 +104,39 @@ class Ray:
         # Random direction in the hemisphere defined by the normal
         reflected_direction = random_hemisphere_direction(normalize(hit_point - sphere.center))
         return hit_point + 0.001 * reflected_direction, reflected_direction, self.color * sphere.color
+def apply_rotation(direction, rotation):
+    rx, ry, rz = rotation
+    rot_x = np.array([[1, 0, 0],
+                         [0, math.cos(rx), -math.sin(rx)],
+                         [0, math.sin(rx), math.cos(rx)]])
+
+    rot_y = np.array([[math.cos(ry), 0, math.sin(ry)],
+                         [0, 1, 0],
+                         [-math.sin(ry), 0, math.cos(ry)]])
+
+    rot_z = np.array([[math.cos(rz), -math.sin(rz), 0],
+                         [math.sin(rz), math.cos(rz), 0],
+                         [0, 0, 1]])
+    direction = direction.dot(rot_x).dot(rot_y).dot(rot_z)
+    return direction
+
+def render_row(args):
+    y, width, height, spheres, max_bounces, reflectedRays, rotation, position, fov, aspect_ratio, scale = args
+    row_pixels = []
+    for x in range(width):
+        ndc_x = (x + 0.5) / width
+        ndc_y = (y + 0.5) / height
+
+        screen_x = (2 * ndc_x - 1) * aspect_ratio * scale
+        screen_y = (1 - 2 * ndc_y) * scale
+
+        ray_direction = normalize(np.array([screen_x, screen_y, -1]))
+        ray_direction = apply_rotation(ray_direction, rotation)
+        offset = np.random.uniform(-0.0007, 0.0007, size=ray_direction.shape)
+        ray = Ray(position, ray_direction)  # + offset)
+        color = ray.trace(spheres, max_bounces, reflectedRays)
+        row_pixels.append(tuple(map(int, (color.flatten() * 255).astype(int))))
+    return row_pixels
 class Camera:
     def __init__(self, position, rotation, width, height, fov):
         self.position = position
@@ -98,6 +144,7 @@ class Camera:
         self.width = width
         self.height = height
         self.fov =math.radians(fov)
+
     def apply_rotation(self, direction):
         rx, ry, rz = self.rotation
         rot_x = np.array([[1, 0, 0],
@@ -114,34 +161,25 @@ class Camera:
         direction = direction.dot(rot_x).dot(rot_y).dot(rot_z)
 
         return direction
-    def render(self, spheres, max_bounces, reflectedRays = 2):
-        image = Image.new("RGB", (self.width, self.height), "black")
-        pixels = image.load()
-
+    def render(self, spheres, max_bounces, reflectedRays):
         aspect_ratio = self.width / self.height
         scale = math.tan(self.fov / 2)
-        for x in range(self.width):
-            os.system('clear')
-            print(x/self.width*100, "%")
-            for y in range(self.height):
-                ndc_x = (x + 0.5) / self.width
-                ndc_y = (y + 0.5) / self.height
-
-                screen_x = (2 * ndc_x - 1) * aspect_ratio * scale
-                screen_y = (1 - 2 * ndc_y) * scale
-
-                ray_direction = normalize(np.array([screen_x, screen_y, -1]))
-                ray_direction = self.apply_rotation(ray_direction)
-                offset = np.random.uniform(-0.0007, 0.0007, size=ray_direction.shape)
-                ray = Ray(self.position, ray_direction + offset)
-                color = ray.trace(spheres, max_bounces, reflectedRays)
-                pixels[x, y] = tuple(map(int, (color.flatten() * 255).astype(int)))
+        with mp.Pool() as pool:
+            pixels = pool.map(render_row, [(y, self.width, self.height, spheres, max_bounces, reflectedRays, 
+                                            self.rotation, self.position, self.fov, aspect_ratio, scale)
+                                           for y in range(self.height)])
+        image = Image.new("RGB", (self.width, self.height), "black")
+        img_pixels = image.load()
+        for y in range(self.height):
+            for x in range(self.width):
+                img_pixels[x, y] = pixels[y][x]
         return image
-
-bola = Sphere([0, -0, -2000], 2000, [255, 230, 42], True)
-bola2 = Sphere([0, 200, 50], 50, [230, 50, 250])
-bola3 = Sphere([0,0, 100], 100, [234, 135, 156])
-camera = Camera([400, 0, 200], [-1.5,0,-1.5], 1000, 700, 60)
-image = camera.render([bola2, bola, bola3], 2, 10)
-
-image.show()
+if __name__ == "__main__":
+    bola = Sphere([100, 100, 0], 100, [255, 255, 255], True)
+    bola2 = Sphere([0, 0, 290], 70, [230, 50, 250], True)
+    bola3 = Sphere([0,0, 100], 200, [234, 135, 156])
+    camera = Camera([400, 0, 200], [-1.5,0,-1.5], 1000, 500, 60)
+    tempo = time.time()
+    image = camera.render2([bola2, bola, bola3], 2, 1)
+    print(time.time() - tempo)
+    image.show()
